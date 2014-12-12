@@ -1,0 +1,241 @@
+#!/usr/bin/python
+
+import sys
+import logging.handlers
+import os.path
+import subprocess
+import xml.etree.ElementTree as ET
+
+
+# some constants
+DNSMASQ_CONF_DIR = '/etc/dnsmasq.d'
+DNSMASQ_SERVICE_NAME = 'dnsmasq'
+SERVICE_HANDLER = '/usr/sbin/service'
+
+
+# logging
+LOG = logging.getLogger('libvirt-network-hook')
+LOG.setLevel(logging.DEBUG)
+
+syslog = logging.handlers.SysLogHandler(address='/dev/log')
+syslog.setLevel(logging.INFO)
+syslog.setFormatter(logging.Formatter('%(name)s: %(levelname)s: %(message)s'))
+LOG.addHandler(syslog)
+
+console = logging.StreamHandler()
+console.setLevel(logging.DEBUG)
+console.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+LOG.addHandler(console)
+
+
+
+class NetworkDomainInfo(object):
+    """
+    class for parsing libvirt's network hook data using an ElementTree.Element
+    opject of the XML data
+    """
+
+    def __init__(self, root):
+        object.__init__(self)
+        self.dnsServer = None
+        self.netAddress = None
+        self.domain = None
+        self.reverseDomain = None
+
+        self.parse(root)
+        
+        
+    def parse(self, root):    
+        self._parseDNSserverAddress(root)
+        self._parseDomain(root)
+        
+
+    def _parseDNSserverAddress(self, root):
+        self.dnsServer = None
+        ip = None
+        ipDefs = root.findall("./network/ip[@address]/[dhcp]")
+        if len(ipDefs) != 0:
+            ip = ipDefs[0]
+        else:
+            ipDefs = root.findall("./network/ip[@address]")
+            if len(ipDefs) != 0:
+                ip = ipDefs[0]
+                
+        if ip is not None:
+            self.dnsServer = ip.get('address')
+            
+        LOG.debug('DNS server address: {}'.format(self.dnsServer))
+
+
+        
+    def _parseDomain(self, root):    
+    
+        self.domain = None
+        self.reverseDomain = None
+        self.netAddress = None
+    
+        domainElem = root.findall("./network/domain[@name]")
+        if len(domainElem) > 0:
+            # we require a special "hacked" format, specific to dnsmasq's 
+            # --domain config option:
+            #   "<domain>,<address range>,local"
+            # this is required to prevent the networks dnsmasq instance to 
+            # send DNS queries for the defined domain to upstream DNS servers 
+            # (otherwise query loops could occure)
+            token = domainElem[0].get('name').split(',')
+            if len(token) == 3 and token[2] == 'local':
+                self.domain = token[0]
+                
+                # based on the network address given in "<network>/<prefix>"
+                # (e.g. "192.168.1.0/24") generate the reverse lookup domain
+                # (e.g. "192.168.1.0/24" -> "1.168.192.in-addr.arpa")
+                netToken = token[1].split('/')
+                if len(netToken) == 2:
+                    self.netAddress = netToken[0]
+                    prefix = netToken[1]
+                    netAddrToken = self.netAddress.split('.')
+                    if len(netAddrToken) == 4:
+                        netAddrToken.reverse()
+                        netAddrToken.append('in-addr.arpa')
+                        # only these network sizes are supported by dnsmasq
+                        if prefix == '24':
+                            self.reverseDomain = '.'.join(netAddrToken[1:])
+                        elif prefix == '16':
+                            self.reverseDomain = '.'.join(netAddrToken[2:])
+                        elif prefix == '8':
+                            self.reverseDomain = '.'.join(netAddrToken[3:])
+            else:
+                LOG.debug('defined domain "{}" does not appear to have the '\
+                    'required format'.format(domainElem[0].get('name')))
+                            
+        LOG.debug('domain: {}, reverse domain: {}, network address: {}'.format(
+            self.domain, self.netAddress, self.reverseDomain))
+                            
+
+
+class DnsmasqConfig(object):
+    """
+    write and remove a dnsmasq config file
+    """
+    def __init__(self, filename):
+        object.__init__(self)
+        
+        self.filename = filename
+        self.confFile = '{}/{}'.format(DNSMASQ_CONF_DIR, self.filename)
+        self.changed = False
+        
+    def setFromNetworkDomainInfo(self, info):
+        self.setDomain(info.domain)
+        self.setReverseDomain(info.reverseDomain)
+        self.setDNSserver(info.dnsServer)
+        
+    def setDomain(self, domain):
+        self.domain = domain
+        
+    def setReverseDomain(self, domain):
+        self.reversedomain = domain
+        
+    def setDNSserver(self, server):
+        self.dnsserver = server
+        
+    def write(self):
+        if self.domain is not None and self.dnsserver is not None:
+            try:
+                LOG.info('write dnsmasq config file {}'.format(self.confFile))
+                with open(self.confFile, 'w') as f:
+                    f.write('# automatically generated by {}\n'\
+                        .format(sys.argv[0]))
+                        
+                    f.write('server=/{}/{}\n'\
+                        .format(self.domain, self.dnsserver))
+                        
+                    if self.reversedomain is not None:
+                        f.write('server=/{}/{}\n'\
+                            .format(self.reversedomain, self.dnsserver))
+                            
+                    self.changed = True
+            except IOError as detail:
+                LOG.error('can not write config file: {}'.format(detail))
+                
+                
+    def remove(self):
+        if os.path.isfile(self.confFile):
+            try:
+                LOG.info('remove dnsmasq config file {}'.format(self.confFile))
+                os.unlink(self.confFile)
+                self.changed = True
+            except IOError as detail:
+                LOG.error('can not remove config file: {}'.format(detail))
+
+                    
+                    
+class DnsmasqService(object):
+    """
+    restart and check existence of a system service
+    """
+    
+    cmd = [SERVICE_HANDLER, DNSMASQ_SERVICE_NAME]
+        
+    @staticmethod
+    def run(args):
+        cmd = DnsmasqService.cmd + args
+        LOG.debug('runnging {}'.format(' '.join(cmd)))
+        ret = subprocess.call(cmd)
+        LOG.debug('return code {}'.format(ret))
+        return ret
+        
+    @staticmethod        
+    def exists():
+        ret = DnsmasqService.run(['status'])
+        return ret != 1
+        
+    @staticmethod        
+    def restart():
+        ret = DnsmasqService.run(['restart'])
+        return ret == 0
+                
+        
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 4:
+        print "usage: {} <network name> <operation> <sub-operation>".format(sys.argv[0])
+        sys.exit(1)
+        
+    networkName = sys.argv[1]
+    operation = sys.argv[2]
+    
+    # early exit 
+    if operation not in ['started', 'stopped']:
+        sys.exit(0)
+        
+    if not DnsmasqService.exists():
+        LOG.debug('there seems to be no system dnsmasq service, exiting')
+        sys.exit(0)
+    
+    LOG.debug('called with {}'.format(str(sys.argv)))
+    
+    configFilename = 'libvirt-network-dns-{}'.format(networkName);
+    conf = DnsmasqConfig(configFilename)
+        
+    if operation == 'started':
+        LOG.info('network "{}" started'.format(networkName))
+        tree = ET.parse(sys.stdin)
+        netInfo = NetworkDomainInfo(tree.getroot())
+        conf.setFromNetworkDomainInfo(netInfo)
+        
+        conf.write()
+                
+    elif operation == 'stopped':
+        LOG.info('network "{}" stopped'.format(networkName))
+        conf.remove()
+    
+    
+    if conf.changed:
+        LOG.info('restarting system dnsmasq service...')
+        if not DnsmasqService.restart():
+            LOG.error('restarting system dnsmasq service failed')
+                
+            
+    sys.exit(0)
+    
